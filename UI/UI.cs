@@ -77,15 +77,15 @@ namespace C3AI.UISystem
             };
            _eventManager.RaiseEvent(eventData); 
         }
-        public bool SubscribeToEvents(IEventListener<IEventData> listenerToSubscribe)
+        public bool SubscribeToEvents(IEventListener<UIEventData> listenerToSubscribe)
         {
-            _eventManager.AddListener((IEventListener<UIEventData>)listenerToSubscribe);
+            _eventManager.AddListener(listenerToSubscribe);
             return true;
         }
 
-        public bool UnsubscribeFromEvents(IEventListener<IEventData> listenerToUnsubscribe)
+        public bool UnsubscribeFromEvents(IEventListener<UIEventData> listenerToUnsubscribe)
         {
-            _eventManager.RemoveListener((IEventListener<UIEventData>)listenerToUnsubscribe);
+            _eventManager.RemoveListener(listenerToUnsubscribe);   
             return true;
         }
 

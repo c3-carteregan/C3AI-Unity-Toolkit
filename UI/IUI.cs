@@ -16,7 +16,7 @@ namespace C3AI.UISystem
         public IUIPage UIPage;
 
     }
-    public interface IUI : IEventSource<IEventData>
+    public interface IUI : IEventSource<UIEventData>
     {
     void OpenPage(IUIPage page, bool closeOpenPages);
         void ClosePage(IUIPage pageToClose);
