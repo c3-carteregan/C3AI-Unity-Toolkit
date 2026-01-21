@@ -13,6 +13,8 @@ namespace C3AI.UISystem
         [SerializeField] private UIPage _startPage;
         private IUIPage[] _uiPages;
 
+        [SerializeField] private Vector3 _closePagePosition = new Vector3(0, 10, 0);
+
         private void Start()
         {
             _uiPages = GetComponentsInChildren<IUIPage>(true);
@@ -51,7 +53,8 @@ namespace C3AI.UISystem
         private void OpenNewPage(IUIPage page)
         {
             _openPages.Add(page);
-            page.GetGameObject().SetActive(true);
+          //  page.GetGameObject().SetActive(true);
+          page.GetGameObject().transform.localPosition = Vector3.zero;
             page.OnPageOpen(this);
             NotifyEventListeners(UIEventType.ON_PAGE_OPEN, page);
         }
@@ -62,7 +65,8 @@ namespace C3AI.UISystem
                 return;
             }
             _openPages.Remove(page);
-            page.GetGameObject().SetActive(false);
+           // page.GetGameObject().SetActive(false);
+           page.GetGameObject().transform.localPosition = _closePagePosition;
             page.OnPageClose(this);
             NotifyEventListeners(UIEventType.ON_PAGE_CLOSED, page);
         }
