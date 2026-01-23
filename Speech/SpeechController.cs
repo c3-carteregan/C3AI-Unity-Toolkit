@@ -39,10 +39,18 @@ namespace C3AI.Voice
                 _ttsSource.SubscribeToEvents(this);
             }
 
+            if(_micButton != null)
+            {
+                _micButton.onClick.AddListener(OnMicButtonClicked);
+            }
             if (_micButtonText != null)
             {
                 _defaultMicButtonText = _micButtonText.text;
             }
+        }
+        private void OnMicButtonClicked()
+        {
+            _sttSource.StartCmdListening("Button click");
         }
         public void Initialize()
             {

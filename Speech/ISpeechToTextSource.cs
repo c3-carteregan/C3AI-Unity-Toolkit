@@ -8,6 +8,8 @@ namespace C3AI.Voice
 		void Initialize();
         void StartKeywordListening();
         void StopKeywordListening();
+
+        void StartCmdListening(string keyword);
     }
     public enum SpeechToTextEventType
     {

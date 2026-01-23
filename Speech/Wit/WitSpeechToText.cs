@@ -445,18 +445,27 @@ namespace C3AI.Voice
                     if (verboseLogging)
                         Debug.Log("Keyword detected.");
 
-                    if (_pauseThenCmdRoutine != null)
-                        StopCoroutine(_pauseThenCmdRoutine);
-
-                    _pauseThenCmdRoutine = StartCoroutine(PauseThenCommand());
-
-                    NotifyEventListeners(SpeechToTextEventType.ON_KEYWORD_DETECTED, text);
+                  StartCmdListening(text);
                 }
                 else
                 {
                     _mode = Mode.Probing;
                 }
             });
+        }
+
+        public void StartCmdListening(string keyword)
+             {
+            if (!_initialized)
+            {
+                return;
+            }
+            if (_pauseThenCmdRoutine != null)
+                StopCoroutine(_pauseThenCmdRoutine);
+
+            _pauseThenCmdRoutine = StartCoroutine(PauseThenCommand());
+
+            NotifyEventListeners(SpeechToTextEventType.ON_KEYWORD_DETECTED, keyword);
         }
 
         private IEnumerator SendPromptClipCoroutine()
