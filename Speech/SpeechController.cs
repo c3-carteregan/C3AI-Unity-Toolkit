@@ -27,7 +27,7 @@ namespace C3AI.Voice
             }
             else
             {
-                _sttSource.Initialize();
+              //  _sttSource.Initialize();
                 _sttSource.SubscribeToEvents(this);
             }
             if (_ttsSource == null)
@@ -39,22 +39,24 @@ namespace C3AI.Voice
                 _ttsSource.SubscribeToEvents(this);
             }
 
-           if(_micButtonText != null)
+            if (_micButtonText != null)
             {
                 _defaultMicButtonText = _micButtonText.text;
             }
         }
+        public void Initialize()
+            {
+            _sttSource.Initialize();
+        }
 
         public void BeginKeywordListening()
         {
-            _micButton.interactable = true;
-            _micButtonText.text = _defaultMicButtonText;
+            EnableMicButton();
             _sttSource.StartKeywordListening();
         }
         public void StopKeywordListening()
         {
-            _micButton.interactable = false;
-            _micButtonText.text = "Please wait...";
+            DisableMicButton("Please wait...");
             _sttSource.StopKeywordListening();
         }
 
@@ -66,7 +68,18 @@ namespace C3AI.Voice
 
         public GameObject GetGameObject()
         {
-           return this == null ? null : this.gameObject;
+            return this == null ? null : this.gameObject;
+        }
+
+        private void EnableMicButton()
+        {
+            _micButtonText.text = _defaultMicButtonText;
+            _micButton.interactable = true;
+        }
+        private void DisableMicButton(string message)
+        {
+            _micButtonText.text = message;
+            _micButton.interactable = false;
         }
 
         public void OnEventOccurred(SpeechToTextEventData eventData)
@@ -76,7 +89,14 @@ namespace C3AI.Voice
                 case SpeechToTextEventType.ON_KEYWORD_DETECTED:
                     break;
                 case SpeechToTextEventType.ON_SPEECH_RECOGNIZED:
+                    DisableMicButton("Waiting for response...");
                     NotifySTTEventListeners(eventData.EventType, eventData.Text);
+                    break;
+                case SpeechToTextEventType.ON_COMMAND_LISTEN_STARTED:
+                    DisableMicButton("Listening for prompt...");
+                    break;
+                case SpeechToTextEventType.ON_EMPTY_CMD_RETURNED:
+                  EnableMicButton();
                     break;
                 default:
                     break;
@@ -91,7 +111,7 @@ namespace C3AI.Voice
 
         public bool UnsubscribeFromEvents(IEventListener<SpeechToTextEventData> listenerToUnsubscribe)
         {
-            return _sttEventManager.RemoveListener(listenerToUnsubscribe);  
+            return _sttEventManager.RemoveListener(listenerToUnsubscribe);
         }
 
         private void NotifySTTEventListeners(SpeechToTextEventType eventType, string text)
@@ -102,7 +122,7 @@ namespace C3AI.Voice
 
         public void OnEventOccurred(TextToSpeechEventData eventData)
         {
-            switch(eventData.EventType)
+            switch (eventData.EventType)
             {
                 case TextToSpeechEventType.ON_SPEECH_STARTED:
                     StopKeywordListening();
@@ -114,5 +134,5 @@ namespace C3AI.Voice
                     break;
             }
         }
-    } 
+    }
 }

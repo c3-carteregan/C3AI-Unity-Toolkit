@@ -4,17 +4,18 @@ using System.Collections;
 using UnityEngine;
 using UnityEngine.Networking;
 
-// WitSpeechUploader.cs
-// Keyword probe -> pause -> command capture with optional silence timeout.
-// Prefers is_final transcript, otherwise last text.
-// Calls OnFinalCMD(finalText) exactly once per command session.
-// Logs Keyword detection + probe text (keyword logging is back).
-// Uses coroutine-based mic start (fixes Quest main-thread busy-wait issues).
-// Uses default mic device on Android/Quest for reliability.
+// WitSpeechToText.cs
+// Fixes added:
+// 1) Wrap safe ring buffer reads (no more AudioClip.GetData overrun across loop boundary)
+// 2) Prompt mode uses sequential chunks (cursor based) instead of "last N seconds" sliding window
+// 3) More robust JSON extraction (real key parsing + JSON unescape) and prefers is_final
+// 4) Silence detection uses the same wrap safe reads (more reliable)
+// 5) Stale callback protection via generation counters (mode changes wont apply old responses)
+// 6) Reduced per tick allocations by reusing buffers where reasonable
+// 7) Keeps mic open; never restarts mic in prompt loop
+// 8) Clearer device selection + logging
 namespace C3AI.Voice
 {
-
-
     public class WitSpeechToText : MonoBehaviour, ISpeechToTextSource
     {
         [Header("Wit")]
@@ -49,6 +50,14 @@ namespace C3AI.Voice
         public float silenceTimeoutSeconds = 2.0f;
         public float silenceRmsThreshold = 0.015f;
 
+        [Header("Prompt Mode")]
+        [Tooltip("If true, continuously sends fixed length clips instead of keyword detection.")]
+        public bool usePromptMode = false;
+        [Tooltip("Length of each clip to send in prompt mode (seconds).")]
+        public float promptClipLengthSeconds = 3.0f;
+        [Tooltip("Minimum RMS level to consider audio as speech in prompt mode. Clips below this threshold are skipped.")]
+        public float promptSilenceThreshold = 0.01f;
+
         [Header("Audio Cue")]
         public AudioSource cueAudioSource;
         [SerializeField] private AudioClip _keywordDetectedAudioClip;
@@ -58,13 +67,11 @@ namespace C3AI.Voice
         public bool autostart = true;
 
         [Header("Logging")]
-        [Tooltip("If false, only CMD mode logs + final CMD text are logged (probe text logging still happens if enabled below).")]
         public bool verboseLogging = true;
-
         [Tooltip("If true, logs probe text each time (keyword logging).")]
         public bool logProbeText = true;
 
-        private enum Mode { Probing, PausingThenCommand, WaitingForCommandEnd, Busy }
+        private enum Mode { Probing, PausingThenCommand, WaitingForCommandEnd, Busy, PromptMode }
         private Mode _mode = Mode.Busy;
 
         private string _micDevice;   // null/empty means default device
@@ -81,43 +88,48 @@ namespace C3AI.Voice
         private float _lastNonSilentTime;
 
         private Coroutine _pauseThenCmdRoutine;
-        private bool _sendingCommand; // guard against double-send
+        private bool _sendingCommand;
         private bool _isListening;
 
-        /// <summary>
-        /// Returns true if the keyword listening loop is currently active.
-        /// </summary>
-        public bool IsListening => _isListening;
+        // Prompt mode state
+        private float _nextPromptClipTime;
+        private bool _sendingPromptClip;
+        private int _promptNextReadFrame; // sequential cursor in ring timeline
 
-        /// <summary>
-        /// Returns the currently selected microphone device name, or null if using default.
-        /// </summary>
+        // Stale callback protection
+        private int _probeGen;
+        private int _promptGen;
+        private int _cmdGen;
+
+        // Reusable buffers to reduce GC
+        private float[] _tempInterleaved;    // frames * channels
+        private float[] _tempMono;           // frames
+        private byte[] _wavBytes;            // 44 + frames*2
+
+        // Small reusable buffers for wrap reads
+        private float[] _chunkA;
+        private float[] _chunkB;
+
+        private bool _initialized = false;
+
+        public bool IsListening => _isListening;
         public string CurrentMicrophoneDevice => _micDevice;
 
-        /// <summary>
-        /// Returns an array of available microphone device names.
-        /// </summary>
         public static string[] GetAvailableMicrophones()
         {
             return Microphone.devices ?? Array.Empty<string>();
         }
 
-        /// <summary>
-        /// Sets the microphone device to use on PC. Has no effect on Android.
-        /// Call this before Start() or restart the microphone after calling.
-        /// </summary>
-        /// <param name="deviceName">The device name, or null/empty for default.</param>
         public void SetPCMicrophoneDevice(string deviceName)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             Debug.LogWarning("WitSpeechToText: SetPCMicrophoneDevice has no effect on Android.");
 #else
             pcMicrophoneDeviceName = deviceName;
-            
-            // If mic is already running, restart it with the new device
+
             if (_micClip != null)
             {
-                Debug.Log($"WitSpeechToText: Switching microphone to '{deviceName ?? "<default>"}'...");
+                Debug.Log("WitSpeechToText: Switching microphone to '" + (deviceName ?? "<default>") + "'...");
                 StartCoroutine(RestartMicrophoneCoroutine());
             }
 #endif
@@ -125,27 +137,25 @@ namespace C3AI.Voice
 
         private IEnumerator RestartMicrophoneCoroutine()
         {
-            // Stop current microphone
-            if (_micClip != null)
-            {
-                if (!string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(_micDevice))
-                    Microphone.End(_micDevice);
-                else if (string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(null))
-                    Microphone.End(null);
-                
-                _micClip = null;
-            }
+            StopListeningInternal();
 
-            _mode = Mode.Busy;
-            
-            // Wait a frame to ensure cleanup
+            // wait a frame to ensure cleanup
             yield return null;
-            
-            // Start with new device
+
+            EnsureRollingBuffer();
             yield return StartMicrophoneCoroutine();
         }
 
         private void Start()
+        {
+            _initialized = autostart;
+            if (_initialized)
+            {
+                SetupBuffer();
+            }
+        }
+
+        private void SetupBuffer()
         {
             EnsureRollingBuffer();
             StartCoroutine(StartMicrophoneCoroutine());
@@ -155,9 +165,15 @@ namespace C3AI.Voice
         {
             if (_micClip == null) return;
 
-            if (_isListening && _mode == Mode.Probing && Time.time >= _nextProbeTime)
+            if (_isListening && usePromptMode && _mode == Mode.PromptMode && Time.time >= _nextPromptClipTime && !_sendingPromptClip)
             {
-                _nextProbeTime = Time.time + keywordProbeIntervalSeconds;
+                _nextPromptClipTime = Time.time + Mathf.Max(0.05f, promptClipLengthSeconds);
+                StartCoroutine(SendPromptClipCoroutine());
+            }
+
+            if (_isListening && !usePromptMode && _mode == Mode.Probing && Time.time >= _nextProbeTime)
+            {
+                _nextProbeTime = Time.time + Mathf.Max(0.05f, keywordProbeIntervalSeconds);
                 StartCoroutine(ProbeKeywordCoroutine());
             }
 
@@ -193,44 +209,78 @@ namespace C3AI.Voice
 
         private void OnDisable()
         {
+            StopListeningInternal();
+        }
+
+        private void StopListeningInternal()
+        {
             try
             {
-                if (!string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(_micDevice))
-                    Microphone.End(_micDevice);
-                else if (string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(null))
-                    Microphone.End(null);
+                _isListening = false;
+                _mode = Mode.Busy;
+
+                // invalidate all in flight callbacks
+                _probeGen++;
+                _promptGen++;
+                _cmdGen++;
+
+                if (_micClip != null)
+                {
+                    if (!string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(_micDevice))
+                        Microphone.End(_micDevice);
+                    else if (string.IsNullOrEmpty(_micDevice) && Microphone.IsRecording(null))
+                        Microphone.End(null);
+                }
+
+                _micClip = null;
             }
             catch { }
         }
 
-        /// <summary>
-        /// Starts the keyword listening loop. The microphone will continue recording in the background.
-        /// </summary>
         public void StartKeywordListening()
         {
-            if (_isListening) return;
+            if (_isListening || !_initialized) return;
 
             _isListening = true;
-            _nextProbeTime = Time.time + Mathf.Max(0.05f, keywordProbeIntervalSeconds);
 
-            if (_mode == Mode.Busy && _micClip != null && !_sendingCommand)
-                _mode = Mode.Probing;
+            if (usePromptMode)
+            {
+                _nextPromptClipTime = Time.time + Mathf.Max(0.05f, promptClipLengthSeconds);
+                _sendingPromptClip = false;
 
-            if (verboseLogging)
-                Debug.Log("WitSpeechToText: StartListening()");
+                // start prompt cursor "now" so you do not resend old audio
+                _promptNextReadFrame = Microphone.GetPosition(_micDevice);
+
+                if (_mode == Mode.Busy && _micClip != null)
+                    _mode = Mode.PromptMode;
+
+                if (verboseLogging)
+                    Debug.Log("WitSpeechToText: StartListening() in Prompt Mode");
+            }
+            else
+            {
+                _nextProbeTime = Time.time + Mathf.Max(0.05f, keywordProbeIntervalSeconds);
+
+                if (_mode == Mode.Busy && _micClip != null && !_sendingCommand)
+                    _mode = Mode.Probing;
+
+                if (verboseLogging)
+                    Debug.Log("WitSpeechToText: StartListening()");
+            }
         }
 
-        /// <summary>
-        /// Stops the keyword listening loop. The microphone will continue recording in the background.
-        /// </summary>
         public void StopKeywordListening()
         {
-            if (!_isListening) return;
+            if (!_isListening || !_initialized) return;
 
             _isListening = false;
 
+            // invalidate in flight prompt or probe callbacks (but leave mic running)
+            _probeGen++;
+            _promptGen++;
+
             if (verboseLogging)
-                Debug.Log("WitSpeechToText: StopListening()");
+                Debug.Log("WitSpeechToText: StopListening()" + (usePromptMode ? " (Prompt Mode)" : ""));
         }
 
         private void BeginSendCommandIfNeeded()
@@ -243,7 +293,10 @@ namespace C3AI.Voice
 
         private void EnsureRollingBuffer()
         {
-            float need = keywordProbeSeconds + postKeywordPauseSeconds + commandMaxSeconds + 2f;
+            float needKeyword = keywordProbeSeconds + postKeywordPauseSeconds + commandMaxSeconds + 2f;
+            float needPrompt = promptClipLengthSeconds + 2f;
+            float need = Mathf.Max(needKeyword, needPrompt);
+
             if (rollingBufferSeconds < need)
                 rollingBufferSeconds = Mathf.CeilToInt(need);
         }
@@ -251,29 +304,26 @@ namespace C3AI.Voice
         private IEnumerator StartMicrophoneCoroutine()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        // Permission diagnostics
-        Debug.Log("Has RECORD_AUDIO permission: " +
-                  UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone));
+            Debug.Log("Has RECORD_AUDIO permission: " +
+                      UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone));
 
-        // Request if needed
-        if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
-        {
-            UnityEngine.Android.Permission.RequestUserPermission(UnityEngine.Android.Permission.Microphone);
-
-            float t0 = Time.time;
-            while (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
+            if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
             {
-                if (Time.time - t0 > 5f)
+                UnityEngine.Android.Permission.RequestUserPermission(UnityEngine.Android.Permission.Microphone);
+
+                float t0 = Time.time;
+                while (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
                 {
-                    Debug.LogError("WitSpeechUploader: Microphone permission not granted.");
-                    yield break;
+                    if (Time.time - t0 > 5f)
+                    {
+                        Debug.LogError("WitSpeechToText: Microphone permission not granted.");
+                        yield break;
+                    }
+                    yield return null;
                 }
-                yield return null;
             }
-        }
 #endif
 
-            // Device list diagnostics (helpful on Quest)
             int deviceCount = (Microphone.devices == null) ? -1 : Microphone.devices.Length;
             Debug.Log("Microphone.devices.Length=" + deviceCount);
             if (Microphone.devices != null)
@@ -282,32 +332,25 @@ namespace C3AI.Voice
                     Debug.Log("Mic device[" + i + "]=" + Microphone.devices[i]);
             }
 
-            // On Android/Quest, always use default mic (null). On PC, use selected device if specified.
 #if UNITY_ANDROID && !UNITY_EDITOR
             _micDevice = null;
 #else
-            // On PC: use specified device name, or null/empty for default
             _micDevice = string.IsNullOrEmpty(pcMicrophoneDeviceName) ? null : pcMicrophoneDeviceName;
-            
-            // Validate that the device exists
+
             if (!string.IsNullOrEmpty(_micDevice))
             {
-                bool deviceFound = false;
+                bool found = false;
                 if (Microphone.devices != null)
                 {
-                    foreach (string device in Microphone.devices)
+                    foreach (string d in Microphone.devices)
                     {
-                        if (device == _micDevice)
-                        {
-                            deviceFound = true;
-                            break;
-                        }
+                        if (d == _micDevice) { found = true; break; }
                     }
                 }
-                
-                if (!deviceFound)
+
+                if (!found)
                 {
-                    Debug.LogWarning($"WitSpeechToText: Specified microphone '{_micDevice}' not found. Falling back to default.");
+                    Debug.LogWarning("WitSpeechToText: Specified microphone '" + _micDevice + "' not found. Falling back to default.");
                     _micDevice = null;
                 }
             }
@@ -316,8 +359,7 @@ namespace C3AI.Voice
             int rate = requestedSampleRate > 0 ? requestedSampleRate : 48000;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-        // Many Android XR devices (including Quest) behave best with 48k.
-        if (rate < 24000) rate = 48000;
+            if (rate < 24000) rate = 48000;
 #endif
 
             _micClip = Microphone.Start(_micDevice, true, rollingBufferSeconds, rate);
@@ -327,17 +369,19 @@ namespace C3AI.Voice
             {
                 if (Time.time - startTime > 3f)
                 {
-                    Debug.LogError("WitSpeechUploader: Microphone did not start. devices.Length=" +
+                    Debug.LogError("WitSpeechToText: Microphone did not start. devices.Length=" +
                                    ((Microphone.devices == null) ? -1 : Microphone.devices.Length));
                     _micClip = null;
                     yield break;
                 }
-                yield return null; // IMPORTANT: yield to avoid Quest deadlock
+                yield return null;
             }
 
             _actualSampleRate = _micClip.frequency;
             _micClipFramesPerChannel = _micClip.samples;
             _micClipChannels = _micClip.channels;
+
+            _promptNextReadFrame = Microphone.GetPosition(_micDevice);
 
             if (verboseLogging)
             {
@@ -348,23 +392,51 @@ namespace C3AI.Voice
                           " channels=" + _micClipChannels);
             }
 
-            _nextProbeTime = Time.time + Mathf.Max(0.05f, keywordProbeIntervalSeconds);
-            _mode = Mode.Probing;
-            _isListening = autostart;
+            _isListening = _initialized;
 
-            if (verboseLogging)
-                Debug.Log("WitSpeechToText ready. Listening: " + _isListening);
+            if (usePromptMode)
+            {
+                _nextPromptClipTime = Time.time + Mathf.Max(0.05f, promptClipLengthSeconds);
+                _sendingPromptClip = false;
+
+                // do not send old audio on autostart
+                _promptNextReadFrame = Microphone.GetPosition(_micDevice);
+
+                _mode = Mode.PromptMode;
+
+                if (verboseLogging)
+                    Debug.Log("WitSpeechToText ready in Prompt Mode. Listening: " + _isListening);
+            }
+            else
+            {
+                _nextProbeTime = Time.time + Mathf.Max(0.05f, keywordProbeIntervalSeconds);
+                _mode = Mode.Probing;
+
+                if (verboseLogging)
+                    Debug.Log("WitSpeechToText ready. Listening: " + _isListening);
+            }
         }
 
         private IEnumerator ProbeKeywordCoroutine()
         {
             _mode = Mode.Busy;
+            int gen = ++_probeGen;
 
-            float[] probe = ReadLastSecondsMono(keywordProbeSeconds);
+            float[] probe = ReadLastSecondsMonoWrapSafe(keywordProbeSeconds);
+            if (probe == null || probe.Length == 0)
+            {
+                _mode = Mode.Probing;
+                yield break;
+            }
+
             ApplyGainInPlace(probe, inputGain);
 
-            yield return PostToWit(BuildWavPcm16Mono(probe, _actualSampleRate), (ok, rawJson, text) =>
+            byte[] wav = BuildWavPcm16MonoReusable(probe, _actualSampleRate);
+
+            yield return PostToWit(wav, (ok, rawJson, text) =>
             {
+                if (gen != _probeGen) return; // stale
+
                 if (logProbeText)
                     Debug.Log("Probe Text: " + (text ?? "<null>"));
 
@@ -387,9 +459,79 @@ namespace C3AI.Voice
             });
         }
 
+        private IEnumerator SendPromptClipCoroutine()
+        {
+            _sendingPromptClip = true;
+            int gen = ++_promptGen;
+
+            int frames = Mathf.Max(1, Mathf.RoundToInt(promptClipLengthSeconds * _actualSampleRate));
+
+            // Wait until enough new audio exists between cursor and current mic position
+            int micPos = Microphone.GetPosition(_micDevice);
+            int available = DistanceInRing(_promptNextReadFrame, micPos, _micClipFramesPerChannel);
+            if (available < frames)
+            {
+                if (verboseLogging)
+                    Debug.Log("Prompt clip waiting for enough audio. NeedFrames=" + frames + " available=" + available);
+
+                _sendingPromptClip = false;
+                yield break;
+            }
+
+            float[] clip = ReadFromStartForFramesMonoWrapSafe(_promptNextReadFrame, frames);
+            _promptNextReadFrame += frames;
+
+            if (clip == null || clip.Length == 0)
+            {
+                _sendingPromptClip = false;
+                yield break;
+            }
+
+            ApplyGainInPlace(clip, inputGain);
+
+            float rms = ComputeRmsFromSamples(clip);
+            if (rms < promptSilenceThreshold)
+            {
+                if (verboseLogging)
+                    Debug.Log("Prompt clip skipped (silence). RMS: " + rms.ToString("F4"));
+
+                _sendingPromptClip = false;
+                yield break;
+            }
+
+            if (verboseLogging)
+                Debug.Log("Sending prompt clip (" + promptClipLengthSeconds + "s, RMS: " + rms.ToString("F4") + ")...");
+
+            byte[] wav = BuildWavPcm16MonoReusable(clip, _actualSampleRate);
+
+            yield return PostToWit(wav, (ok, rawJson, text) =>
+            {
+                if (gen != _promptGen) return; // stale
+
+                if (ok && !string.IsNullOrWhiteSpace(text))
+                {
+                    if (verboseLogging)
+                        Debug.Log("Prompt Text: " + text);
+
+                    try { OnFinalCMD(text); }
+                    catch (Exception e) { Debug.LogError("OnFinalCMD threw: " + e); }
+                }
+                else if (!ok && verboseLogging)
+                {
+                    Debug.LogError("Prompt clip recognition failed.");
+                }
+
+                _sendingPromptClip = false;
+            });
+        }
+
         private IEnumerator PauseThenCommand()
         {
             _mode = Mode.PausingThenCommand;
+
+            // invalidate probe and prompt callbacks, but keep mic going
+            _probeGen++;
+            _promptGen++;
 
             if (postKeywordPauseSeconds > 0f)
                 yield return new WaitForSeconds(postKeywordPauseSeconds);
@@ -399,37 +541,58 @@ namespace C3AI.Voice
             _lastNonSilentTime = Time.time;
             _sendingCommand = false;
 
-            if (cueAudioSource != null)
+            if (cueAudioSource != null && _keywordDetectedAudioClip != null)
             {
                 cueAudioSource.clip = _keywordDetectedAudioClip;
                 cueAudioSource.Play();
             }
-                
 
             if (verboseLogging)
                 Debug.Log("CMD capture started.");
+
+            NotifyEventListeners(SpeechToTextEventType.ON_COMMAND_LISTEN_STARTED, null);
 
             _mode = Mode.WaitingForCommandEnd;
         }
 
         private IEnumerator SendCommandCoroutine()
         {
+            int gen = ++_cmdGen;
+
             int frames = Mathf.RoundToInt((Time.time - _commandStartTime) * _actualSampleRate);
             frames = Mathf.Clamp(frames, 1, Mathf.RoundToInt(commandMaxSeconds * _actualSampleRate));
 
-            float[] cmd = ReadFromStartForFramesMono(_commandStartFrame, frames);
+            float[] cmd = ReadFromStartForFramesMonoWrapSafe(_commandStartFrame, frames);
+            if (cmd == null || cmd.Length == 0)
+            {
+                _sendingCommand = false;
+                _mode = Mode.Probing;
+                yield break;
+            }
+
             ApplyGainInPlace(cmd, inputGain);
 
-            yield return PostToWit(BuildWavPcm16Mono(cmd, _actualSampleRate), (ok, rawJson, text) =>
+            byte[] wav = BuildWavPcm16MonoReusable(cmd, _actualSampleRate);
+
+            yield return PostToWit(wav, (ok, rawJson, text) =>
             {
+                if (gen != _cmdGen) return; // stale
+
                 if (ok)
                 {
-                    Debug.Log("CMD Text: " + text);
+                    // Debug.Log("CMD Text: " + text);
 
                     if (!string.IsNullOrWhiteSpace(text))
                     {
                         try { OnFinalCMD(text); }
                         catch (Exception e) { Debug.LogError("OnFinalCMD threw: " + e); }
+                    }
+                    else
+                    {
+                        NotifyEventListeners(SpeechToTextEventType.ON_EMPTY_CMD_RETURNED, null);
+                        if (verboseLogging)
+                            Debug.Log("CMD recognition returned empty text.");
+
                     }
                 }
                 else
@@ -439,23 +602,132 @@ namespace C3AI.Voice
                 }
 
                 _sendingCommand = false;
-                _mode = Mode.Probing;
+
+                // If user switched to prompt mode while this was sending, respect that.
+                if (usePromptMode && _isListening)
+                    _mode = Mode.PromptMode;
+                else
+                    _mode = Mode.Probing;
             });
         }
 
-        // Override/subscribe in your own code by adding a component that derives from this,
-        // or change this to an event if you prefer.
         protected virtual void OnFinalCMD(string finalText)
         {
-            // Intentionally empty. Override in a subclass or modify to invoke an event.
             Debug.Log("OnFinalCMD: " + finalText);
             NotifyEventListeners(SpeechToTextEventType.ON_SPEECH_RECOGNIZED, finalText);
-           // FindObjectOfType<RamblrChat>().SendChatMessage(finalText);
         }
 
         private float ComputeRecentRms(float seconds)
         {
-            float[] samples = ReadLastSecondsMono(seconds);
+            float[] samples = ReadLastSecondsMonoWrapSafe(seconds);
+            if (samples == null || samples.Length == 0) return 0f;
+            return ComputeRmsFromSamples(samples);
+        }
+
+        // ----------------- AUDIO BUFFER HELPERS (WRAP SAFE) -----------------
+
+        private float[] ReadLastSecondsMonoWrapSafe(float seconds)
+        {
+            if (_micClip == null) return null;
+
+            int frames = Mathf.Max(1, Mathf.RoundToInt(seconds * _actualSampleRate));
+            int end = Microphone.GetPosition(_micDevice);
+            int startFrame = end - frames;
+            return ReadFromStartForFramesMonoWrapSafe(startFrame, frames);
+        }
+
+        private float[] ReadFromStartForFramesMonoWrapSafe(int startFrame, int frames)
+        {
+            if (_micClip == null) return null;
+            frames = Mathf.Max(1, frames);
+
+            EnsureFloatCapacity(ref _tempMono, frames);
+            EnsureFloatCapacity(ref _tempInterleaved, frames * _micClipChannels);
+
+            int channels = _micClipChannels;
+            int ring = _micClipFramesPerChannel;
+
+            int start = Mod(startFrame, ring);
+
+            // How many frames until end of ring from "start"
+            int framesToEnd = ring - start;
+
+            if (frames <= framesToEnd)
+            {
+                // single contiguous read
+                _micClip.GetData(_tempInterleaved, start);
+                InterleavedToMono(_tempInterleaved, channels, frames, _tempMono);
+                return CopyOutMono(_tempMono, frames);
+            }
+            else
+            {
+                // wrap: read tail, then head
+                int aFrames = framesToEnd;
+                int bFrames = frames - framesToEnd;
+
+                EnsureFloatCapacity(ref _chunkA, aFrames * channels);
+                EnsureFloatCapacity(ref _chunkB, bFrames * channels);
+
+                _micClip.GetData(_chunkA, start);
+                _micClip.GetData(_chunkB, 0);
+
+                // Convert both chunks into _tempMono in place
+                int outIndex = 0;
+                InterleavedToMonoInto(_chunkA, channels, aFrames, _tempMono, ref outIndex);
+                InterleavedToMonoInto(_chunkB, channels, bFrames, _tempMono, ref outIndex);
+
+                return CopyOutMono(_tempMono, frames);
+            }
+        }
+
+        private static void InterleavedToMono(float[] interleaved, int channels, int frames, float[] monoOut)
+        {
+            for (int i = 0; i < frames; i++)
+            {
+                float sum = 0f;
+                int baseIdx = i * channels;
+                for (int c = 0; c < channels; c++)
+                    sum += interleaved[baseIdx + c];
+                monoOut[i] = sum / channels;
+            }
+        }
+
+        private static void InterleavedToMonoInto(float[] interleaved, int channels, int frames, float[] monoOut, ref int outIndex)
+        {
+            for (int i = 0; i < frames; i++)
+            {
+                float sum = 0f;
+                int baseIdx = i * channels;
+                for (int c = 0; c < channels; c++)
+                    sum += interleaved[baseIdx + c];
+                monoOut[outIndex++] = sum / channels;
+            }
+        }
+
+        private static float[] CopyOutMono(float[] src, int frames)
+        {
+            // Return a right sized array (still allocates).
+            // If you want zero alloc, change PostToWit to accept (float[] buffer, int length).
+            float[] outArr = new float[frames];
+            Array.Copy(src, 0, outArr, 0, frames);
+            return outArr;
+        }
+
+        private static void EnsureFloatCapacity(ref float[] arr, int needed)
+        {
+            if (arr == null || arr.Length < needed)
+                arr = new float[needed];
+        }
+
+        private static void ApplyGainInPlace(float[] s, float g)
+        {
+            if (s == null) return;
+            for (int i = 0; i < s.Length; i++)
+                s[i] = Mathf.Clamp(s[i] * g, -1f, 1f);
+        }
+
+        private static float ComputeRmsFromSamples(float[] samples)
+        {
             if (samples == null || samples.Length == 0) return 0f;
 
             double sum = 0;
@@ -465,51 +737,21 @@ namespace C3AI.Voice
             return Mathf.Sqrt((float)(sum / samples.Length));
         }
 
-        // ----------------- AUDIO BUFFER HELPERS -----------------
-
-        private float[] ReadLastSecondsMono(float seconds)
-        {
-            int frames = Mathf.RoundToInt(seconds * _actualSampleRate);
-            int end = Microphone.GetPosition(_micDevice);
-            return ReadFromStartForFramesMono(end - frames, frames);
-        }
-
-        private float[] ReadFromStartForFramesMono(int startFrame, int frames)
-        {
-            if (_micClip == null) return null;
-
-            int channels = _micClipChannels;
-            int start = Mod(startFrame, _micClipFramesPerChannel);
-
-            float[] mono = new float[frames];
-            float[] temp = new float[frames * channels];
-
-            _micClip.GetData(temp, start);
-
-            for (int i = 0; i < frames; i++)
-            {
-                float sum = 0;
-                for (int c = 0; c < channels; c++)
-                    sum += temp[i * channels + c];
-                mono[i] = sum / channels;
-            }
-            return mono;
-        }
-
         private static int Mod(int x, int m) => (x % m + m) % m;
 
-        private static void ApplyGainInPlace(float[] s, float g)
+        private static int DistanceInRing(int from, int to, int ringSize)
         {
-            if (s == null) return;
-            for (int i = 0; i < s.Length; i++)
-                s[i] = Mathf.Clamp(s[i] * g, -1f, 1f);
+            int f = Mod(from, ringSize);
+            int t = Mod(to, ringSize);
+            if (t >= f) return t - f;
+            return (ringSize - f) + t;
         }
 
         // ----------------- WIT -----------------
 
         private IEnumerator PostToWit(byte[] wav, Action<bool, string, string> done)
         {
-            var req = new UnityWebRequest($"https://api.wit.ai/speech?v={witApiVersion}", "POST");
+            var req = new UnityWebRequest("https://api.wit.ai/speech?v=" + witApiVersion, "POST");
             req.uploadHandler = new UploadHandlerRaw(wav);
             req.downloadHandler = new DownloadHandlerBuffer();
             req.SetRequestHeader("Authorization", "Bearer " + witServerAccessToken);
@@ -530,54 +772,305 @@ namespace C3AI.Voice
             }
 
             string raw = req.downloadHandler.text;
-            string text = ExtractPreferredFinalTextOrLastText(raw);
+            string text = ExtractPreferredFinalTextOrLastText_Robust(raw);
 
             done(true, raw, text);
         }
 
-        // ----------------- JSON PARSE -----------------
+        // ----------------- JSON PARSE (ROBUST ENOUGH FOR WIT) -----------------
 
-        private static string ExtractPreferredFinalTextOrLastText(string raw)
+        // Extracts the most recent "text" that belongs to an object where is_final == true if present.
+        // Otherwise returns the last "text" found.
+        // This does real JSON string parsing (handles escapes) and simple object key tracking.
+        private static string ExtractPreferredFinalTextOrLastText_Robust(string raw)
         {
             if (string.IsNullOrEmpty(raw)) return null;
 
             string lastText = null;
-            string lastFinal = null;
+            string lastFinalText = null;
 
-            int idx = 0;
-            while ((idx = raw.IndexOf("\"text\"", idx, StringComparison.Ordinal)) >= 0)
+            int i = 0;
+            int n = raw.Length;
+
+            // Track state within the current object
+            bool inObject = false;
+            int objectDepth = 0;
+            string currentText = null;
+            bool currentIsFinal = false;
+
+            while (i < n)
             {
-                int colon = raw.IndexOf(':', idx);
-                if (colon < 0) break;
+                char ch = raw[i];
 
-                int q1 = raw.IndexOf('"', colon + 1);
-                if (q1 < 0) break;
-                q1 += 1;
-
-                int q2 = raw.IndexOf('"', q1);
-                if (q2 < 0) break;
-
-                string text = raw.Substring(q1, q2 - q1);
-                lastText = text;
-
-                int objStart = raw.LastIndexOf('{', idx);
-                int objEnd = raw.IndexOf('}', idx);
-                if (objStart >= 0 && objEnd > objStart)
+                if (ch == '{')
                 {
-                    string obj = raw.Substring(objStart, objEnd - objStart);
-                    if (obj.Contains("\"is_final\": true", StringComparison.Ordinal))
-                        lastFinal = text;
+                    objectDepth++;
+                    inObject = true;
+
+                    // entering a new object level: reset only when it is a "new object" at this depth
+                    // Here we reset on every '{' and apply when that object closes.
+                    currentText = null;
+                    currentIsFinal = false;
+
+                    i++;
+                    continue;
                 }
 
-                idx = q2;
+                if (ch == '}')
+                {
+                    if (inObject)
+                    {
+                        // finalize this object
+                        if (!string.IsNullOrEmpty(currentText))
+                        {
+                            lastText = currentText;
+                            if (currentIsFinal)
+                                lastFinalText = currentText;
+                        }
+                    }
+
+                    objectDepth--;
+                    if (objectDepth <= 0)
+                    {
+                        objectDepth = 0;
+                        inObject = false;
+                    }
+
+                    i++;
+                    continue;
+                }
+
+                // parse keys inside objects only
+                if (inObject && ch == '"')
+                {
+                    string key = ReadJsonString(raw, ref i);
+                    SkipWhitespace(raw, ref i);
+
+                    if (i < n && raw[i] == ':')
+                    {
+                        i++;
+                        SkipWhitespace(raw, ref i);
+
+                        if (key == "text")
+                        {
+                            if (i < n && raw[i] == '"')
+                            {
+                                string val = ReadJsonString(raw, ref i);
+                                currentText = val;
+                            }
+                            else
+                            {
+                                // non string, skip value
+                                SkipJsonValue(raw, ref i);
+                            }
+                        }
+                        else if (key == "is_final")
+                        {
+                            bool? b = ReadJsonBool(raw, ref i);
+                            if (b.HasValue)
+                                currentIsFinal = b.Value;
+                            else
+                                SkipJsonValue(raw, ref i);
+                        }
+                        else
+                        {
+                            // ignore other keys
+                            SkipJsonValue(raw, ref i);
+                        }
+
+                        continue;
+                    }
+                }
+
+                i++;
             }
 
-            return lastFinal ?? lastText;
+            return lastFinalText ?? lastText;
+        }
+
+        private static void SkipWhitespace(string s, ref int i)
+        {
+            int n = s.Length;
+            while (i < n)
+            {
+                char c = s[i];
+                if (c == ' ' || c == '\n' || c == '\r' || c == '\t') i++;
+                else break;
+            }
+        }
+
+        private static string ReadJsonString(string s, ref int i)
+        {
+            // expects s[i] == '"'
+            int n = s.Length;
+            i++; // skip opening quote
+
+            // build into char buffer via StringBuilder only if needed
+            // (avoid allocations when no escapes)
+            int start = i;
+            bool hasEscape = false;
+
+            while (i < n)
+            {
+                char c = s[i];
+                if (c == '\\') { hasEscape = true; i += 2; continue; }
+                if (c == '"') break;
+                i++;
+            }
+
+            int end = i;
+            if (i < n && s[i] == '"') i++; // skip closing quote
+
+            if (!hasEscape)
+            {
+                return s.Substring(start, end - start);
+            }
+
+            // unescape
+            return JsonUnescape(s, start, end);
+        }
+
+        private static string JsonUnescape(string s, int start, int end)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(end - start);
+
+            int i = start;
+            while (i < end)
+            {
+                char c = s[i++];
+                if (c != '\\')
+                {
+                    sb.Append(c);
+                    continue;
+                }
+
+                if (i >= end) break;
+                char e = s[i++];
+
+                if (e == '"') sb.Append('"');
+                else if (e == '\\') sb.Append('\\');
+                else if (e == '/') sb.Append('/');
+                else if (e == 'b') sb.Append('\b');
+                else if (e == 'f') sb.Append('\f');
+                else if (e == 'n') sb.Append('\n');
+                else if (e == 'r') sb.Append('\r');
+                else if (e == 't') sb.Append('\t');
+                else if (e == 'u')
+                {
+                    // unicode escape \uXXXX
+                    if (i + 3 < end)
+                    {
+                        int code = 0;
+                        for (int k = 0; k < 4; k++)
+                        {
+                            char h = s[i + k];
+                            int v =
+                                (h >= '0' && h <= '9') ? (h - '0') :
+                                (h >= 'a' && h <= 'f') ? (10 + (h - 'a')) :
+                                (h >= 'A' && h <= 'F') ? (10 + (h - 'A')) :
+                                0;
+                            code = (code << 4) | v;
+                        }
+                        sb.Append((char)code);
+                        i += 4;
+                    }
+                }
+                else
+                {
+                    // unknown escape, keep it
+                    sb.Append(e);
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static bool? ReadJsonBool(string s, ref int i)
+        {
+            int n = s.Length;
+            if (i + 3 < n && s[i] == 't' && s[i + 1] == 'r' && s[i + 2] == 'u' && s[i + 3] == 'e')
+            {
+                i += 4;
+                return true;
+            }
+            if (i + 4 < n && s[i] == 'f' && s[i + 1] == 'a' && s[i + 2] == 'l' && s[i + 3] == 's' && s[i + 4] == 'e')
+            {
+                i += 5;
+                return false;
+            }
+            return null;
+        }
+
+        private static void SkipJsonValue(string s, ref int i)
+        {
+            // Skips a JSON value starting at s[i].
+            // Handles strings, numbers, true/false/null, objects, arrays.
+            int n = s.Length;
+            SkipWhitespace(s, ref i);
+            if (i >= n) return;
+
+            char c = s[i];
+
+            if (c == '"')
+            {
+                ReadJsonString(s, ref i);
+                return;
+            }
+
+            if (c == '{')
+            {
+                int depth = 0;
+                while (i < n)
+                {
+                    char ch = s[i++];
+                    if (ch == '"') { ReadJsonString(s, ref i); continue; }
+                    if (ch == '{') depth++;
+                    else if (ch == '}')
+                    {
+                        depth--;
+                        if (depth <= 0) break;
+                    }
+                }
+                return;
+            }
+
+            if (c == '[')
+            {
+                int depth = 0;
+                while (i < n)
+                {
+                    char ch = s[i++];
+                    if (ch == '"') { ReadJsonString(s, ref i); continue; }
+                    if (ch == '[') depth++;
+                    else if (ch == ']')
+                    {
+                        depth--;
+                        if (depth <= 0) break;
+                    }
+                    else if (ch == '{')
+                    {
+                        // enter object
+                        i--;
+                        SkipJsonValue(s, ref i);
+                    }
+                }
+                return;
+            }
+
+            // number, true, false, null, or unknown: read until delimiter
+            while (i < n)
+            {
+                char ch = s[i];
+                if (ch == ',' || ch == '}' || ch == ']' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ')
+                    break;
+                i++;
+            }
         }
 
         private static bool ContainsKeyword(string t, string k, bool boundary)
         {
             if (string.IsNullOrEmpty(t) || string.IsNullOrEmpty(k)) return false;
+
             t = t.ToLowerInvariant();
             k = k.ToLowerInvariant();
 
@@ -590,15 +1083,20 @@ namespace C3AI.Voice
             return left && right;
         }
 
-        // ----------------- WAV -----------------
+        // ----------------- WAV (REUSABLE) -----------------
 
-        private static byte[] BuildWavPcm16Mono(float[] samples, int rate)
+        private byte[] BuildWavPcm16MonoReusable(float[] samples, int rate)
         {
-            int data = samples.Length * 2;
-            byte[] b = new byte[44 + data];
+            int dataBytes = samples.Length * 2;
+            int totalBytes = 44 + dataBytes;
+
+            if (_wavBytes == null || _wavBytes.Length != totalBytes)
+                _wavBytes = new byte[totalBytes];
+
+            byte[] b = _wavBytes;
 
             WriteAscii(b, 0, "RIFF");
-            WriteInt32(b, 4, 36 + data);
+            WriteInt32(b, 4, 36 + dataBytes);
             WriteAscii(b, 8, "WAVEfmt ");
             WriteInt32(b, 16, 16);
             WriteInt16(b, 20, 1);
@@ -608,15 +1106,16 @@ namespace C3AI.Voice
             WriteInt16(b, 32, 2);
             WriteInt16(b, 34, 16);
             WriteAscii(b, 36, "data");
-            WriteInt32(b, 40, data);
+            WriteInt32(b, 40, dataBytes);
 
             int o = 44;
-            foreach (float f in samples)
+            for (int i = 0; i < samples.Length; i++)
             {
-                short s = (short)(Mathf.Clamp(f, -1f, 1f) * 32767);
+                short s = (short)(Mathf.Clamp(samples[i], -1f, 1f) * 32767);
                 WriteInt16(b, o, s);
                 o += 2;
             }
+
             return b;
         }
 
@@ -639,35 +1138,39 @@ namespace C3AI.Voice
             b[o + 3] = (byte)(v >> 24);
         }
 
+        // ----------------- EVENTS -----------------
+
         public void Initialize()
         {
-           
+            _initialized = true;
+            SetupBuffer();
+            StartKeywordListening();
         }
 
         public GameObject GetGameObject()
         {
             return this == null ? null : this.gameObject;
         }
+
         private InterfaceEventManager<SpeechToTextEventData> _eventManager =
             new InterfaceEventManager<SpeechToTextEventData>();
+
         public bool SubscribeToEvents(IEventListener<SpeechToTextEventData> listenerToSubscribe)
         {
-            Debug.Log($"Subscribing listener {listenerToSubscribe.GetGameObject().name} to SpeechToText events.______________________________________________________");
+            Debug.Log("Subscribing listener " + listenerToSubscribe.GetGameObject().name + " to SpeechToText events.");
             return _eventManager.AddListener(listenerToSubscribe);
-          
         }
 
         public bool UnsubscribeFromEvents(IEventListener<SpeechToTextEventData> listenerToUnsubscribe)
         {
             return _eventManager.RemoveListener(listenerToUnsubscribe);
-            
         }
+
         private void NotifyEventListeners(SpeechToTextEventType eventType, string text)
         {
-            Debug.Log($"Notifying listeners of event {eventType} with text: {text}");
+            Debug.Log("Notifying listeners of event " + eventType + " with text: " + text);
             var eventData = new SpeechToTextEventData(eventType, this, text);
-            _eventManager.RaiseEvent(eventData);    
+            _eventManager.RaiseEvent(eventData);
         }
     }
-
 }

@@ -13,6 +13,8 @@ namespace C3AI.Voice
     {
         ON_KEYWORD_DETECTED,
         ON_SPEECH_RECOGNIZED,
+        ON_COMMAND_LISTEN_STARTED,
+        ON_EMPTY_CMD_RETURNED,
     }
     public class SpeechToTextEventData : IEventData
     {
