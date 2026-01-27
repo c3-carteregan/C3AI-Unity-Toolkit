@@ -28,6 +28,7 @@ namespace C3AI.UISystem
                     ClosePage(page);
                 }
             }
+            OpenPage(_startPage, true);
         }
 
 
